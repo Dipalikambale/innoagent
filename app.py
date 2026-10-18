@@ -3,6 +3,7 @@ app.py
 Interactive Streamlit Dashboard for InnoAgent.
 Visualizes the 5 stages of Design Thinking:
 Empathize -> Define -> Ideate -> Evaluate -> Prototype.
+Supports dynamic custom problem statements and optional live LLM inference.
 """
 
 import streamlit as st
@@ -54,20 +55,27 @@ selected_preset = st.sidebar.selectbox("Choose Problem Scenario", list(PRESETS.k
 if selected_preset == "Custom Problem Statement":
     user_input_notes = st.sidebar.text_area(
         "Enter Raw Field Notes or User Interviews",
-        value="Enter unstructured user feedback, pain points, or field observations...",
-        height=220
+        value="Patients suffering from chronic lower back pain during long desk work reported that standard ergonomic chairs do not support posture when leaning forward. Physical therapy is expensive. Users requested an affordable, wearable posture biofeedback harness that can be fabricated using 3D printed parts and elastic straps.",
+        height=200
     )
 else:
     user_input_notes = st.sidebar.text_area(
         "Field Interview Notes",
         value=PRESETS[selected_preset],
-        height=220
+        height=200
     )
+
+st.sidebar.markdown("---")
+llm_api_key = st.sidebar.text_input(
+    "LLM API Key (Optional)",
+    type="password",
+    help="Optional: Paste a Google Gemini or OpenAI API Key to enable open-ended generative LLM reasoning. If left blank, InnoAgent runs its built-in dynamic semantic engine."
+)
 
 if st.sidebar.button("Run Design Thinking Agent Team", type="primary"):
     with st.spinner("Multi-agent team executing Empathize, Define, Ideate, Evaluate, and Prototype workflows..."):
         orchestrator = InnoAgentOrchestrator()
-        results = orchestrator.run_pipeline(user_input_notes)
+        results = orchestrator.run_pipeline(user_input_notes, api_key=llm_api_key.strip() if llm_api_key else None)
         st.session_state["inno_results"] = results
 
 if "inno_results" in st.session_state:
@@ -77,13 +85,14 @@ if "inno_results" in st.session_state:
     empathy = res["empathy_map"]
     framing = res["problem_definition"]
     pugh = res["pugh_evaluation"]
+    domain = res.get("domain_topic", "System")
 
     # Top KPI Metrics Row
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.metric("Discovery Stage", "5 / 5 Complete")
+        st.metric("Domain Focus", domain)
     with c2:
-        st.metric("Primary Persona", empathy["persona_title"].split()[0])
+        st.metric("Primary Persona", empathy["persona_title"].split()[0] if empathy["persona_title"] else "User")
     with c3:
         st.metric("Selected Concept", winner["concept_id"])
     with c4:
@@ -111,7 +120,7 @@ if "inno_results" in st.session_state:
         with col_e1:
             st.markdown("#### SAYS (Explicit Statements)")
             for item in empathy["says"]:
-                st.write(f"- \"{item}\"")
+                st.write(f"- {item}")
 
             st.markdown("#### DOES (Observed Behaviors)")
             for item in empathy["does"]:
@@ -120,7 +129,7 @@ if "inno_results" in st.session_state:
         with col_e2:
             st.markdown("#### THINKS (Internal Doubts & Beliefs)")
             for item in empathy["thinks"]:
-                st.write(f"- \"{item}\"")
+                st.write(f"- {item}")
 
             st.markdown("#### FEELS (Emotional State)")
             for item in empathy["feels"]:
@@ -158,7 +167,6 @@ if "inno_results" in st.session_state:
         st.subheader("Stage 3: Divergent Concept Architectures")
         for concept in res["concepts"]:
             is_winner = concept["concept_id"] == winner["concept_id"]
-            box_class = "winner-box" if is_winner else "card-empathy"
             badge = " [SELECTED WINNER]" if is_winner else ""
 
             with st.expander(f"{concept['concept_id']}: {concept['title']}{badge}", expanded=True):
@@ -182,7 +190,7 @@ if "inno_results" in st.session_state:
     # TAB 4: EVALUATE (PUGH MATRIX)
     with tab4:
         st.subheader("Stage 4: Multi-Criteria Pugh Decision Matrix")
-        st.caption("Baseline: Conventional Imported Commercial Unit (Score = 0 across all criteria)")
+        st.caption("Baseline: Conventional Commercial Alternative (Score = 0 across all criteria)")
 
         # Prepare DataFrame
         df_pugh = pd.DataFrame(pugh)
@@ -274,4 +282,4 @@ Total Estimated BOM: INR {proto['total_estimated_bom_inr']:,.2f}
             mime="text/markdown"
         )
 else:
-    st.info("Select a problem scenario in the sidebar and click 'Run Design Thinking Agent Team' to initiate the discovery pipeline.")
+    st.info("Select a scenario or enter custom field notes in the sidebar, then click 'Run Design Thinking Agent Team' to start.")
