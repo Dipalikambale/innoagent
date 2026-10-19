@@ -50,20 +50,31 @@ separation system that can operate off-grid and be fabricated in a regional make
     "Custom Problem Statement": ""
 }
 
-selected_preset = st.sidebar.selectbox("Choose Problem Scenario", list(PRESETS.keys()), index=0)
+selected_preset = st.sidebar.selectbox(
+    "Choose Problem Scenario",
+    list(PRESETS.keys()),
+    index=0,
+    key="problem_scenario",
+)
 
 if selected_preset == "Custom Problem Statement":
     user_input_notes = st.sidebar.text_area(
         "Enter Raw Field Notes or User Interviews",
         value="Patients suffering from chronic lower back pain during long desk work reported that standard ergonomic chairs do not support posture when leaning forward. Physical therapy is expensive. Users requested an affordable, wearable posture biofeedback harness that can be fabricated using 3D printed parts and elastic straps.",
-        height=200
+        height=200,
+        key="notes_custom",
     )
 else:
     user_input_notes = st.sidebar.text_area(
         "Field Interview Notes",
         value=PRESETS[selected_preset],
-        height=200
+        height=200,
+        key=f"notes_{selected_preset}",
     )
+
+if st.session_state.get("last_preset") != selected_preset:
+    st.session_state["last_preset"] = selected_preset
+    st.session_state.pop("inno_results", None)
 
 st.sidebar.markdown("---")
 llm_api_key = st.sidebar.text_input(

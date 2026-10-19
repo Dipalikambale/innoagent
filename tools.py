@@ -114,121 +114,189 @@ ENVIRONMENT_KEYWORDS = {
     "office": "Indoor office environment requiring quiet operation and ergonomic safety",
     "kitchen": "Food-handling environment with moisture, heat, and contamination requirements",
     "laboratory": "Controlled lab environment requiring precision and repeatability",
-    "underwater": "Subsea or water-exposed environment requiring sealed enclosures"
+    "underwater": "Subsea or water-exposed environment requiring sealed enclosures",
+    "factory": "Factory floor with long standing hours, vibration, and limited rest breaks",
+    "school": "Resource-constrained classroom with intermittent or no grid electricity",
+    "clinic": "Primary healthcare facility with unstable power and limited spare parts"
 }
+
+# Multi-word product phrases scored before single-token domain guesses.
+KNOWN_PRODUCT_PHRASES = [
+    "oxygen concentrator", "oxygen generation", "oxygen cylinder",
+    "drip irrigation", "water filtration", "microplastic",
+    "grain storage", "gunny sack", "metal silo",
+    "solar panel", "solar power", "lumbar support", "back pain",
+    "posture harness", "sewing machine", "ergonomic chair"
+]
+
+# Scored problem families. Highest keyword hit-count wins; generic fallback otherwise.
+PROBLEM_FAMILIES = {
+    "medical_oxygen": {
+        "keywords": ["oxygen", "concentrator", "respiratory", "cylinder", "blackout",
+                     "clinic", "clinician", "patient", "healthcare", "distress"],
+        "domain": "Off-Grid Medical Oxygen",
+        "persona": "Rural Clinician / Primary Healthcare Operator",
+        "environment": "Primary healthcare sub-centre with 6-10 hour daily grid outages",
+    },
+    "water_filtration": {
+        "keywords": ["filter", "filtration", "silt", "microplastic", "irrigation",
+                     "drip", "contamination", "clog", "emitter", "canal"],
+        "domain": "Irrigation Water Filtration",
+        "persona": "Agricultural Farmer / Drip Irrigation Operator",
+        "environment": "Open-canal irrigation field with silt, debris, and off-grid power",
+    },
+    "grain_storage": {
+        "keywords": ["grain", "silo", "harvest", "gunny", "rat", "moisture",
+                     "storage", "flood", "sack", "post-harvest"],
+        "domain": "Post-Harvest Grain Storage",
+        "persona": "Smallholder Farmer / Grain Store Operator",
+        "environment": "Village storage yard exposed to monsoon moisture, rats, and flooding",
+    },
+    "rural_energy": {
+        "keywords": ["solar", "electricity", "projector", "laptop", "charging",
+                     "school", "teacher", "panel", "grid", "blackout"],
+        "domain": "Rural Classroom Electrification",
+        "persona": "Rural Teacher / Student Community",
+        "environment": "Off-grid village school with fragile, high-cost commercial solar kits",
+    },
+    "ergonomics": {
+        "keywords": ["back", "lumbar", "posture", "chair", "pain", "harness",
+                     "standing", "sewing", "ergonomic", "wearable", "desk"],
+        "domain": "Wearable Posture & Lumbar Support",
+        "persona": "Standing Textile / Desk Worker",
+        "environment": "Long-duration standing or seated work with no affordable ergonomic support",
+    },
+}
+
+
+def _word_hits(text_lower: str, keywords: List[str]) -> int:
+    score = 0
+    for kw in keywords:
+        if re.search(rf"\b{re.escape(kw)}s?\b", text_lower):
+            score += 1
+    return score
+
+
+def classify_problem_family(text_lower: str) -> Tuple[str, int]:
+    scored = {
+        fid: _word_hits(text_lower, spec["keywords"])
+        for fid, spec in PROBLEM_FAMILIES.items()
+    }
+    best = max(scored, key=scored.get)
+    return (best, scored[best]) if scored[best] >= 2 else ("generic", scored[best])
+
+
+def extract_product_phrase(text: str, top_nouns: List[str]) -> str:
+    text_lower = text.lower()
+    for phrase in KNOWN_PRODUCT_PHRASES:
+        if phrase in text_lower:
+            return phrase
+    request_match = re.search(
+        r"(?:requested|need|needs|want|require)\s+(?:a|an)\s+(.{8,90}?)(?:\.| that | which )",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if request_match:
+        return request_match.group(1).strip(" ,;")
+    if len(top_nouns) >= 2:
+        return f"{top_nouns[0]} {top_nouns[1]}"
+    return top_nouns[0] if top_nouns else "field system"
 
 
 def deep_parse(text: str) -> Dict[str, Any]:
     """
-    Deeply analyzes free-form user text to extract:
-    - Detected persona from role keywords
-    - The primary subject/product domain
-    - Actual pain sentences from the text
-    - Environment context
-    - Action verbs (what users are forced to do)
-    - Key nouns (physical components, tools, materials mentioned)
+    Deeply analyzes free-form user text to extract persona, environment,
+    problem family, product phrase, and evidence sentences from the notes.
     """
     text_lower = text.lower()
     sentences = [s.strip() for s in re.split(r'[.\n!?]+', text) if len(s.strip()) > 10]
 
-    # 1. Detect persona
     persona = "End-User facing operational constraints"
     for kw, label in PERSONA_KEYWORDS.items():
-        if kw in text_lower:
+        if re.search(rf"\b{re.escape(kw)}s?\b", text_lower):
             persona = label
             break
 
-    # 2. Detect environment
     environment = "General operating context with limited resources"
     for kw, label in ENVIRONMENT_KEYWORDS.items():
-        if kw in text_lower:
+        if re.search(rf"\b{re.escape(kw)}s?\b", text_lower):
             environment = label
             break
 
-    # 3. Find pain sentences (sentences containing pain indicator words)
     pain_sentences = [s for s in sentences if any(p in s.lower() for p in PAIN_VERBS)]
     if not pain_sentences:
         pain_sentences = sentences[:3]
 
-    # 4. Extract main nouns (likely product/technology references)
     all_words = re.findall(r'\b[a-zA-Z]{4,}\b', text_lower)
-
-    # Detect proper nouns (capitalized mid-sentence in original text) — these are place/city names
-    # Exclude their lowercase forms from domain candidates
     proper_noun_pattern = re.findall(r'(?<!\.\s)(?<![!?\s][A-Z])\b([A-Z][a-z]{3,})\b', text)
     proper_nouns_lower = {w.lower() for w in proper_noun_pattern}
 
-    # Words to exclude from domain detection: persona roles, generic action verbs, location adjectives
     DOMAIN_EXCLUDE = set(STOPWORDS) | proper_nouns_lower | {
-        # Persona / role words
         "worker", "workers", "farmer", "farmers", "nurse", "nurses", "doctor", "patient",
         "student", "engineer", "driver", "teacher", "researcher", "operator", "operators",
         "welder", "carpenter", "child", "elderly", "disabled", "people", "person", "users",
-        # Generic situation words
         "suffer", "cannot", "afford", "spend", "hours", "every", "year", "daily", "because",
         "chronic", "serious", "factory", "currently", "existing", "using", "used", "would",
         "could", "should", "their", "these", "those", "some", "many", "much", "each", "both",
-        "like", "make", "take", "come", "much", "only", "very", "also", "even", "still",
+        "like", "make", "take", "come", "only", "very", "also", "even", "still",
         "already", "often", "always", "never", "there", "here", "then", "when", "while",
-        # Generic problem words (not product-specific)
         "problem", "issue", "issues", "solution", "design", "device",
         "local", "field", "area", "region", "place", "time", "process", "nearest",
     }
 
     content_words = [w for w in all_words if w not in DOMAIN_EXCLUDE]
-
     from collections import Counter
     word_freq = Counter(content_words)
-    top_nouns = [w for w, _ in word_freq.most_common(15) if len(w) > 4]
+    top_nouns = [w for w, _ in word_freq.most_common(15) if len(w) > 3]
 
-    # Prefer domain words that are clearly about a PRODUCT or technology:
-    PRODUCT_SIGNALS = [
-        "pump", "pump", "valve", "filter", "panel", "motor", "sensor", "grain", "silo",
-        "sewing", "machine", "lumbar", "posture", "harness", "solar", "battery", "water",
-        "chair", "storage", "dryer", "press", "mould", "wheel", "cart", "strap", "brace",
-        "scaffold", "light", "power", "cooler", "heater", "drip", "spray", "weave",
-        "loom", "lathe", "drill", "grinder", "cutter", "blower", "compressor", "ladder",
-        "helmet", "glove", "mask", "vest", "apron", "boot", "scaffold", "conveyor",
-    ]
-    # Check if any product-signal noun appears in top_nouns and prefer it
-    for sig in PRODUCT_SIGNALS:
-        if sig in top_nouns:
-            primary_domain = sig.capitalize()
-            break
+    family_id, family_score = classify_problem_family(text_lower)
+    product_phrase = extract_product_phrase(text, top_nouns)
+
+    if family_id != "generic":
+        spec = PROBLEM_FAMILIES[family_id]
+        primary_domain = spec["domain"]
+        persona = spec["persona"]
+        environment = spec["environment"]
     else:
-        primary_domain = top_nouns[0].capitalize() if top_nouns else "System"
+        primary_domain = product_phrase.title()
 
-    # 5. Extract what users are forced to do as workarounds
     workaround_sentences = [
         s for s in sentences
         if any(v in s.lower() for v in ["manually", "workaround", "improvise", "replace", "transport",
-                                         "carry", "walk", "wait", "repair", "tape", "fix", "travel"])
+                                         "carry", "walk", "wait", "repair", "tape", "fix", "travel", "fold"])
     ]
 
-    # 6. Detect any cost/weight/time constraints mentioned
     constraints_raw = [
         s for s in sentences
         if any(c in s.lower() for c in ["cost", "budget", "weight", "heavy", "hours", "slow",
-                                         "affordable", "cheap", "power", "electricity", "battery"])
+                                         "affordable", "cheap", "power", "electricity", "battery",
+                                         "cannot afford", "expensive"])
     ]
 
-    # 7. What users have requested / want
     request_sentences = [
         s for s in sentences
         if any(r in s.lower() for r in ["need", "want", "request", "require", "wish", "hoped", "asked"])
     ]
 
+    body_related = _word_hits(text_lower, ["wear", "wearable", "posture", "lumbar", "harness", "brace", "pain"])
+    offgrid = _word_hits(text_lower, ["electricity", "blackout", "off-grid", "solar", "battery", "grid"])
+
     return {
         "persona": persona,
         "environment": environment,
         "primary_domain": primary_domain,
+        "product_phrase": product_phrase,
+        "problem_family": family_id,
+        "family_score": family_score,
         "top_nouns": top_nouns,
         "pain_sentences": pain_sentences,
         "workaround_sentences": workaround_sentences,
         "constraints_raw": constraints_raw,
         "request_sentences": request_sentences,
         "all_sentences": sentences,
-        "original_text": text
+        "original_text": text,
+        "body_related": body_related > 0,
+        "offgrid": offgrid > 0,
     }
 
 
@@ -275,6 +343,636 @@ def call_llm(prompt: str, api_key: Optional[str] = None) -> Optional[Dict]:
     return None
 
 
+def _quote(sentence: str, fallback: str) -> str:
+    text = (sentence or fallback).strip().strip('"')
+    return f'"{text}"'
+
+
+def family_solution_kit(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Problem-specific empathy needs, HMWs, architectures, Pugh weights, and BOM.
+    Generic fallback still uses the user's words, but never a single copy-pasted machine template.
+    """
+    family = ctx.get("problem_family", "generic")
+    domain = ctx.get("primary_domain", "Field System")
+    product = ctx.get("product_phrase", domain.lower())
+    env = ctx.get("environment", "field environment")
+    pain = ctx.get("pain_sentences") or [f"Existing {product} options fail in daily use"]
+    request = ctx.get("request_sentences") or []
+    body_related = ctx.get("body_related", False)
+    offgrid = ctx.get("offgrid", False)
+
+    kits = {
+        "medical_oxygen": {
+            "latent_needs": [
+                "Continuous medical oxygen during 6-10 hour village blackouts without relying on delayed cylinder trucks",
+                "A concentrator architecture that local technicians can service with non-imported tools and spare parts",
+                "A dual-path supply so a clinic is never left with zero oxygen when the grid or one compressor fails",
+            ],
+            "hmw": [
+                "How might we generate medical-grade oxygen at a sub-centre when the grid is down for most of the day?",
+                "How might we store enough buffer oxygen to cover overnight outages without waiting for steel cylinders?",
+                "How might we keep zeolite beds, valves, and compressors maintainable with locally available hardware?",
+                "How might we warn clinicians before oxygen purity or pressure drops below a safe threshold?",
+            ],
+            "pugh": {"CONCEPT_A": (2, 2, 2, 2), "CONCEPT_B": (2, 1, 0, 1), "CONCEPT_C": (1, 1, 1, 2)},
+            "concepts": _oxygen_concepts(),
+            "bom_theme": "oxygen",
+        },
+        "water_filtration": {
+            "latent_needs": [
+                "Continuous silt and debris separation that does not clog drip emitters within two days",
+                "A self-cleaning filter that farmers can backflush without buying disposable cartridges",
+                "Off-grid operation so filtration still runs when village electricity is unavailable",
+            ],
+            "hmw": [
+                "How might we remove silt and micro-debris from canal water before it reaches drip emitters?",
+                "How might we backflush the filter using the water's own flow instead of replacement cartridges?",
+                "How might we fabricate the separator in a regional makerspace from steel, mesh, and 3D-printed fittings?",
+                "How might we give farmers a visible clog indicator without a smartphone app?",
+            ],
+            "pugh": {"CONCEPT_A": (1, 2, 2, 2), "CONCEPT_B": (2, 1, 0, 1), "CONCEPT_C": (2, 2, 2, 1)},
+            "concepts": _filtration_concepts(),
+            "bom_theme": "filtration",
+        },
+        "grain_storage": {
+            "latent_needs": [
+                "Hermetic, rat-proof grain storage that does not depend on unaffordable steel silos",
+                "Moisture control during monsoon so harvest losses drop well below 30 percent",
+                "A raised, flood-tolerant store that a household can assemble from local materials",
+            ],
+            "hmw": [
+                "How might we keep grain dry and sealed through monsoon humidity without a commercial metal silo?",
+                "How might we block rats and insects using mesh, lids, and raised plinths farmers already understand?",
+                "How might we raise the store above flood level using locally cast or packed foundations?",
+                "How might we share a modular silo among neighbouring farms to cut per-household cost?",
+            ],
+            "pugh": {"CONCEPT_A": (2, 2, 2, 2), "CONCEPT_B": (2, 1, 0, 1), "CONCEPT_C": (1, 2, 2, 2)},
+            "concepts": _grain_concepts(),
+            "bom_theme": "grain",
+        },
+        "rural_energy": {
+            "latent_needs": [
+                "A rugged classroom power hub that can run lights, charge laptops, and drive a projector",
+                "Solar hardware that survives dust, heat, and handling better than fragile commercial panels",
+                "A shared battery cabinet so the whole school is not dependent on one expensive rooftop kit",
+            ],
+            "hmw": [
+                "How might we power lights, laptop charging, and a projector in a school with no grid connection?",
+                "How might we protect solar generation from dust, impact, and theft with locally made enclosures?",
+                "How might we share one battery bank across classrooms instead of buying a panel per room?",
+                "How might we keep the system repairable when commercial inverters fail?",
+            ],
+            "pugh": {"CONCEPT_A": (1, 2, 2, 2), "CONCEPT_B": (2, 1, 1, 1), "CONCEPT_C": (2, 2, 2, 2)},
+            "concepts": _energy_concepts(),
+            "bom_theme": "energy",
+        },
+        "ergonomics": {
+            "latent_needs": [
+                "Affordable lumbar support that works while standing or leaning forward, not only in an office chair",
+                "A wearable brace workers can put on without buying an ergonomic chair they cannot afford",
+                "Posture feedback that reminds the user before chronic pain sets in after a 10-hour shift",
+            ],
+            "hmw": [
+                "How might we support the lumbar curve during 10-hour standing or forward-leaning work?",
+                "How might we make the support wearable so it works at a sewing machine, not only at a desk?",
+                "How might we fabricate the harness from 3D-printed stays and elastic straps in a makerspace?",
+                "How might we give gentle biofeedback before pain becomes chronic?",
+            ],
+            "pugh": {"CONCEPT_A": (1, 2, 2, 1), "CONCEPT_B": (2, 1, 0, 1), "CONCEPT_C": (2, 2, 2, 2)},
+            "concepts": _ergonomics_concepts(),
+            "bom_theme": "ergonomics",
+        },
+    }
+
+    if family in kits:
+        return kits[family]
+
+    third_concept = _wearable_generic_concept(domain, product, env) if body_related else _community_generic_concept(domain, product, env)
+    pugh_c = (2, 2, 2, 2) if body_related else ((1, 2, 2, 2) if offgrid else (1, 1, 1, 2))
+    pugh_a = (2, 2, 2, 2) if offgrid and not body_related else (1, 2, 2, 2)
+    pugh_b = (2, 1, 0, 1)
+    latent = []
+    for s in request[:2]:
+        latent.append(s.strip())
+    latent.append(f"A locally maintainable {product} that addresses: {pain[0].rstrip('.')}.")
+    latent = latent[:3]
+    while len(latent) < 3:
+        latent.append(f"Lower-cost, field-repairable alternative to the current {product}.")
+
+    return {
+        "latent_needs": latent,
+        "hmw": [
+            f"How might we solve '{pain[0].rstrip('.')}' without importing a commercial {product}?",
+            f"How might we fabricate a {product} using makerspace processes and local hardware?",
+            f"How might we keep the {product} usable when power, spare parts, or specialist labour are missing?",
+            f"How might we give users a clear status signal so failures are caught before downtime spreads?",
+        ],
+        "pugh": {"CONCEPT_A": pugh_a, "CONCEPT_B": pugh_b, "CONCEPT_C": pugh_c},
+        "concepts": [
+            _passive_generic_concept(domain, product, env, ctx),
+            _smart_generic_concept(domain, product, env, ctx),
+            third_concept,
+        ],
+        "bom_theme": "generic",
+    }
+
+
+def _oxygen_concepts() -> List[ConceptArchitecture]:
+    return [
+        ConceptArchitecture(
+            concept_id="CONCEPT_A",
+            title="Pedal-Assist Dual-Canister PSA Oxygen Rig",
+            working_principle="A bicycle-driven oil-free compressor feeds two zeolite molecular-sieve canisters in a pressure-swing cycle. Mechanical sequencing valves switch beds without a microcontroller, and a small buffer cylinder stores oxygen for blackout hours.",
+            subsystem_mapping={
+                "Power / Actuation": "Bicycle crank, flywheel, and belt-driven oil-free piston compressor",
+                "Separation Stage": "Twin zeolite 13X canisters with cam-timed pressure-swing valves",
+                "Chassis & Structure": "Welded mild-steel frame with lockable caster base for clinic floors",
+                "Purity & Feedback": "Mechanical oxygen flowmeter plus zirconia cell with analog needle gauge",
+            },
+            manufacturing_strategy="Local fabrication of the steel frame and cam timer; zeolite canisters and medical tubing sourced as COTS; no imported PLC.",
+            strengths=[
+                "Produces oxygen during multi-hour grid outages without a battery bank",
+                "Compressor and valves are serviceable with village workshop tools",
+                "Buffer cylinder covers overnight demand after daytime pedalling or dynamo assist",
+            ],
+            limitations=[
+                "Requires intermittent human or dynamo input; not fully unattended",
+                "Larger clinic-floor footprint than a commercial concentrator",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_B",
+            title="12V Solar Molecular-Sieve Concentrator",
+            working_principle="A 12V BLDC compressor and solenoid-timed PSA beds run from a rooftop solar panel and lithium pack, delivering continuous low-flow oxygen with digital purity alarms.",
+            subsystem_mapping={
+                "Power / Actuation": "150W solar, MPPT, 12V LiFePO4 pack, BLDC compressor",
+                "Separation Stage": "Heated zeolite towers with solenoid PSA switching",
+                "Chassis & Structure": "Powder-coated aluminium enclosure with medical-grade inlet filter",
+                "Purity & Feedback": "OLED purity, flow, and battery-hours display with buzzer alarm",
+            },
+            manufacturing_strategy="COTS solar and compressor modules in a locally bent enclosure; firmware on an open microcontroller.",
+            strengths=[
+                "Unattended oxygen during daytime solar hours",
+                "Closed-loop purity control closer to commercial concentrators",
+                "Hot-swap battery allows limited night operation",
+            ],
+            limitations=[
+                "Depends on solar charging discipline and battery replacement",
+                "Electronics and solenoids are harder to repair locally than a pedal rig",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_C",
+            title="Cylinder-Buffer Hybrid with Gravity Reservoir",
+            working_principle="A small concentrator slowly fills a water-displacement gravity reservoir and one refurbished steel cylinder. Gravity feed supplies the ward if both grid and compressor stop.",
+            subsystem_mapping={
+                "Power / Actuation": "Intermittent grid or solar compressor used only to top up storage",
+                "Separation Stage": "Single zeolite bed plus water-seal oxygen holder",
+                "Chassis & Structure": "Raised reservoir stand and strapped cylinder cradle",
+                "Purity & Feedback": "Bobber level gauge and low-pressure whistle alarm",
+            },
+            manufacturing_strategy="Reuse of existing clinic cylinders; masonry or steel reservoir stand built by local welders.",
+            strengths=[
+                "Creates an oxygen buffer from equipment clinics already receive",
+                "Gravity feed works with zero electricity",
+                "Lowest electronic complexity of the three options",
+            ],
+            limitations=[
+                "Water-seal purity is harder to certify than PSA output",
+                "Still needs periodic compressor time to refill storage",
+            ],
+        ),
+    ]
+
+
+def _filtration_concepts() -> List[ConceptArchitecture]:
+    return [
+        ConceptArchitecture(
+            concept_id="CONCEPT_A",
+            title="Hydrocyclone + Gravity Settling Train",
+            working_principle="Canal water is accelerated in a hydrocyclone so silt exits a grit pot, then dwells in a two-chamber settling tank before a stainless mesh. No pump is required when a 1.5 m head is available.",
+            subsystem_mapping={
+                "Power / Actuation": "Gravity head from canal bund; optional hand primer",
+                "Separation Stage": "Hydrocyclone grit pot, baffled settler, 80-mesh stainless screen",
+                "Chassis & Structure": "HDPE tanks strapped to a laser-cut plywood and angle-iron skid",
+                "Flow & Feedback": "Transparent sight glass and float that drops when the mesh clogs",
+            },
+            manufacturing_strategy="Rolled-sheet cyclone, makerspace-cut flanges, HDPE drums from local suppliers.",
+            strengths=[
+                "No electricity and no disposable cartridges",
+                "Grit pot can be emptied with a bucket in minutes",
+                "Materials match what a regional makerspace already stocks",
+            ],
+            limitations=[
+                "Needs elevation difference or a raised inlet drum",
+                "Fine organic slime still needs occasional mesh scrubbing",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_B",
+            title="12V Auto-Backflush Screen Filter",
+            working_principle="A low-wattage pump drives irrigation water through a rotating nylon screen. Differential-pressure switches reverse flow for 20 seconds whenever clogging is detected.",
+            subsystem_mapping={
+                "Power / Actuation": "12V diaphragm pump and solar trickle charger",
+                "Separation Stage": "Motorised nylon drum screen with reverse-flush nozzles",
+                "Chassis & Structure": "PVC pressure housing and 3D-printed end caps",
+                "Flow & Feedback": "Differential pressure switch, LED clog lamp, hour meter",
+            },
+            manufacturing_strategy="COTS pump and screen; printed housings; simple Arduino-free analog switching.",
+            strengths=[
+                "Self-cleaning under dirty canal conditions",
+                "Maintains drip pressure better than a passive tank",
+                "Alerts the farmer when backflush is happening",
+            ],
+            limitations=[
+                "Needs solar or battery upkeep",
+                "Pump diaphragms are a recurring spare",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_C",
+            title="Bio-Sand and Cloth Prefilter Skid",
+            working_principle="A layered sand-gravel biosand bed plus a washable cloth prefilter removes silt and a large share of microbes. Periodic bucket backwash replaces cartridge changes.",
+            subsystem_mapping={
+                "Power / Actuation": "Gravity feed from a header drum filled by hand or solar pump",
+                "Separation Stage": "Cloth sock, coarse gravel, sand bed, outlet spigot",
+                "Chassis & Structure": "Food-grade drum stack on a flood-raised timber pallet",
+                "Flow & Feedback": "Painted high/low water lines and a simple turbidity jar test",
+            },
+            manufacturing_strategy="Drums, sand, and cloth sourced locally; timber stand from village carpentry.",
+            strengths=[
+                "Almost no moving parts and near-zero operating cost",
+                "Farmers already understand sand-and-cloth cleaning",
+                "Can be built in a day without CNC equipment",
+            ],
+            limitations=[
+                "Lower peak flow than a pressurised screen",
+                "Sand bed needs correct packing to avoid channelling",
+            ],
+        ),
+    ]
+
+
+def _grain_concepts() -> List[ConceptArchitecture]:
+    return [
+        ConceptArchitecture(
+            concept_id="CONCEPT_A",
+            title="Raised Hermetic Drum Battery",
+            working_principle="Food-grade HDPE drums with gasketed lids sit on a rat-proof masonry plinth. Grain is loaded dry, lids are sealed, and a simple moisture card inside each drum shows monsoon risk without electronics.",
+            subsystem_mapping={
+                "Power / Actuation": "None - loading is manual with a grain scoop and lid clamp",
+                "Storage Stage": "Stacked 200 L hermetic drums with inner liners",
+                "Chassis & Structure": "Cement-stabilised plinth 400 mm above flood line, weld-mesh skirt",
+                "Moisture & Feedback": "Cobalt-free humidity card and padlock hasp on each lid",
+            },
+            manufacturing_strategy="Local mason for the plinth; drums and mesh from the taluka market; no imported silo.",
+            strengths=[
+                "Stops rat entry and flood soaking that destroy gunny sacks",
+                "Households can add drums as harvest volume grows",
+                "Repair is a lid gasket, not a specialist silo crew",
+            ],
+            limitations=[
+                "Filling many drums is slower than tipping into one tall silo",
+                "Drums must be kept out of direct noon sun to limit condensation",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_B",
+            title="Solar-Vented Mini Silo with Moisture Alarm",
+            working_principle="A thin-gauge GI cylinder gets a solar-powered fan and DHT moisture probe. When humidity rises, the fan vents the headspace and an alarm lamp warns the farmer.",
+            subsystem_mapping={
+                "Power / Actuation": "20W panel, 12V fan, small sealed lead-acid battery",
+                "Storage Stage": "1.2 m GI silo with airtight lid and outlet slide",
+                "Chassis & Structure": "Tripod stand with rat baffle collar",
+                "Moisture & Feedback": "DHT sensor, LED lamp, and buzzer on an open MCU",
+            },
+            manufacturing_strategy="Local sheet-metal rolling plus a makerspace electronics pod.",
+            strengths=[
+                "Active drying during unexpected rain spells",
+                "Single bulk store is faster to fill than many drums",
+                "Gives an explicit humidity warning",
+            ],
+            limitations=[
+                "Fan, battery, and sensor fail modes need electronics skill",
+                "Higher first cost than drums on a plinth",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_C",
+            title="Community Super-Bag Cooperative Cage",
+            working_principle="Hermetic triple-layer grain bags sit inside a shared weld-mesh cage on a raised platform. Neighbouring farms lock in harvest lots, cutting per-family steel cost.",
+            subsystem_mapping={
+                "Power / Actuation": "None",
+                "Storage Stage": "PICS-style hermetic bags, 50 kg lots",
+                "Chassis & Structure": "Lockable weld-mesh cage and timber pallet deck",
+                "Moisture & Feedback": "Shared weighing scale and moisture meter on loan from the group",
+            },
+            manufacturing_strategy="Cage welded at the village workshop; bags purchased in bulk by the cooperative.",
+            strengths=[
+                "Spreads cost across households that cannot buy a metal silo",
+                "Bags are portable if a family must move grain",
+                "Mesh cage is a visible rat barrier",
+            ],
+            limitations=[
+                "Needs trust and a shared lock protocol",
+                "Bags puncture if handled with hooks",
+            ],
+        ),
+    ]
+
+
+def _energy_concepts() -> List[ConceptArchitecture]:
+    return [
+        ConceptArchitecture(
+            concept_id="CONCEPT_A",
+            title="Daylight Pipes plus Hand-Crank Charging Locker",
+            working_principle="Roof-mounted daylight pipes light classrooms without panels. A locker of hand-crank and bicycle dynamos charges a small shared battery for evening LED lamps and phone charging.",
+            subsystem_mapping={
+                "Power / Actuation": "Daylight pipes by day; bicycle dynamo charging rail after school",
+                "Distribution Stage": "12V LED string and USB charge locker",
+                "Chassis & Structure": "Lockable timber locker bolted to the classroom wall",
+                "Control & Feedback": "Analog voltmeter and red/green charge lamp",
+            },
+            manufacturing_strategy="Local carpenter for the locker; COTS LEDs and dynamo hubs; reflective pipe from aluminium sheet.",
+            strengths=[
+                "No fragile rooftop glass panel to steal or crack",
+                "Daytime teaching no longer depends on electricity",
+                "Students can contribute charging via the bicycle rail",
+            ],
+            limitations=[
+                "Cannot run a bright projector for long without extra storage",
+                "Human charging time is a chore if used every evening",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_B",
+            title="Ruggedised 12V Solar Classroom Hub",
+            working_principle="A polycarbonate-covered 200W panel charges a LiFePO4 hub that powers lights, laptop charging, and a low-watt LED projector with low-voltage disconnect.",
+            subsystem_mapping={
+                "Power / Actuation": "200W panel, MPPT, 100Ah LiFePO4, 12V distribution",
+                "Distribution Stage": "Fused USB-C PD ports and projector DC converter",
+                "Chassis & Structure": "Steel cage mount and dust-sealed indoor hub box",
+                "Control & Feedback": "State-of-charge display and low-battery cutoff",
+            },
+            manufacturing_strategy="COTS solar modules in a locally welded anti-theft cage; hub assembled in a Fab Lab.",
+            strengths=[
+                "Supports projectors and laptops that teachers actually requested",
+                "Polycarbonate and cage address fragile-panel failures",
+                "Standard 12V parts are easier to replace than AC inverters",
+            ],
+            limitations=[
+                "Still a capital cost the school must fund or share",
+                "Battery replacement after several years",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_C",
+            title="Shared Micro-Hub on a Rolling Cart",
+            working_principle="One protected battery cart rolls between classrooms. Teachers book projector hours; lights in each room are separate 5W LEDs from a tiny local pack.",
+            subsystem_mapping={
+                "Power / Actuation": "Central cart with panel input and 12V bus",
+                "Distribution Stage": "Umbilical cable and per-room LED puck lights",
+                "Chassis & Structure": "Lockable rolling steel cart with cable reels",
+                "Control & Feedback": "Booking slate plus SOC meter on the cart",
+            },
+            manufacturing_strategy="School workshop cart; one protected panel rather than many fragile kits.",
+            strengths=[
+                "Avoids buying a full solar kit for every classroom",
+                "Cart can be locked in the staff room overnight",
+                "Matches how rural schools already share scarce equipment",
+            ],
+            limitations=[
+                "Only one classroom gets the projector at a time",
+                "Requires a simple booking habit among teachers",
+            ],
+        ),
+    ]
+
+
+def _ergonomics_concepts() -> List[ConceptArchitecture]:
+    return [
+        ConceptArchitecture(
+            concept_id="CONCEPT_A",
+            title="Sit-Stand Counterweight Stool and Lumbar Pad",
+            working_principle="A leaning stool with a spring-loaded lumbar pad takes part of body weight during 10-hour standing work at sewing machines, replacing folded rags with a stable mechanical rest.",
+            subsystem_mapping={
+                "Power / Actuation": "Coil spring and gas-strut assist, no electricity",
+                "Support Stage": "Adjustable lumbar pad and chest-lean cushion",
+                "Chassis & Structure": "Powder-coated steel tripod with non-slip feet",
+                "Fit & Feedback": "Height pin holes and a simple comfort click-stop",
+            },
+            manufacturing_strategy="Local welding of the tripod; foam pads cut in a Fab Lab; COTS gas strut.",
+            strengths=[
+                "Immediately reduces standing load without a wearable learning curve",
+                "Repairable in a factory maintenance shop",
+                "Far cheaper than an imported ergonomic chair",
+            ],
+            limitations=[
+                "Does not move with the worker if they leave the machine",
+                "Needs floor space beside each sewing station",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_B",
+            title="IMU Biofeedback Vest",
+            working_principle="A lightweight vest with a lumbar IMU vibrates when the wearer slumps or leans without support for more than 30 seconds, training posture during the shift.",
+            subsystem_mapping={
+                "Power / Actuation": "Coin-cell or 3.7V LiPo with a day's charge",
+                "Support Stage": "Soft vest; feedback only, no structural stay",
+                "Chassis & Structure": "Sewn textile with a snap-in electronics pod",
+                "Fit & Feedback": "Haptic motor and LED for slouch events",
+            },
+            manufacturing_strategy="Local stitching plus a makerspace electronics pod.",
+            strengths=[
+                "Works at any machine or desk, including forward lean",
+                "Creates awareness before pain peaks at end of shift",
+                "Small and easy to share across a line",
+            ],
+            limitations=[
+                "Does not mechanically unload the spine",
+                "Needs charging and will be ignored if vibration is annoying",
+            ],
+        ),
+        ConceptArchitecture(
+            concept_id="CONCEPT_C",
+            title="3D-Printed Wearable Lumbar Harness",
+            working_principle="PETG lumbar stays in an elastic harness provide passive extension support while standing or leaning forward. Optional click-in pads replace rag bolsters workers currently fold by hand.",
+            subsystem_mapping={
+                "Power / Actuation": "Elastic strain in webbing; optional removable stay",
+                "Support Stage": "Contoured 3D-printed lumbar shell and thoracic strap",
+                "Chassis & Structure": "Breathable belt with Velcro and quick-release buckles",
+                "Fit & Feedback": "Three size shells and a pressure-foam comfort layer",
+            },
+            manufacturing_strategy="FDM PETG stays, webbing and buckles from garment suppliers in the same textile cluster.",
+            strengths=[
+                "Matches the request for an affordable wearable that works without an office chair",
+                "Can be printed in sizes for different workers the same week",
+                "No charging, so it survives a 10-hour factory shift",
+            ],
+            limitations=[
+                "Must be fitted well or it will be left in a locker",
+                "Plastic stays need a fatigue check after months of sweat and flex",
+            ],
+        ),
+    ]
+
+
+def _passive_generic_concept(domain: str, product: str, env: str, ctx: Dict[str, Any]) -> ConceptArchitecture:
+    pain = (ctx.get("pain_sentences") or [product])[0]
+    return ConceptArchitecture(
+        concept_id="CONCEPT_A",
+        title=f"Zero-Electricity Mechanical {domain}",
+        working_principle=f"A purely mechanical architecture that addresses '{pain.rstrip('.')}' using levers, gravity, springs, or human power so the {product} still works when utilities fail.",
+        subsystem_mapping={
+            "Power / Actuation": f"Human, gravity, or spring input sized for the {product}",
+            "Core Function": f"Mechanical stage that performs the {product} job without electronics",
+            "Chassis & Structure": f"Laser-cut plywood or welded frame suited to {env.lower()}",
+            "Status Feedback": "Analog gauge or sight window, no firmware",
+        },
+        manufacturing_strategy="Makerspace-cut structure, COTS bearings and fasteners, local hardware only.",
+        strengths=[
+            f"Independent of grid power for the core {product} task",
+            "Repairable with basic tools",
+            "Lower capital cost than imported commercial equipment",
+        ],
+        limitations=[
+            "May need intermittent human input",
+            "Larger envelope than a compact electronic product",
+        ],
+    )
+
+
+def _smart_generic_concept(domain: str, product: str, env: str, ctx: Dict[str, Any]) -> ConceptArchitecture:
+    return ConceptArchitecture(
+        concept_id="CONCEPT_B",
+        title=f"12V Sensor-Assisted {domain}",
+        working_principle=f"A low-voltage mechatronic {product} uses a microcontroller and sensors to keep performance stable in {env.lower()}.",
+        subsystem_mapping={
+            "Power / Actuation": "12V BLDC or solenoid pack with solar/battery option",
+            "Core Function": f"Motorised {product} stage with closed-loop sensing",
+            "Chassis & Structure": "Bent aluminium or printed housings",
+            "Status Feedback": "OLED or LED status for throughput and faults",
+        },
+        manufacturing_strategy="COTS electronics plus Fab Lab printed brackets.",
+        strengths=[
+            f"Automated {product} delivery with less physical effort",
+            "Can alarm before failure",
+            "Compact compared with a fully mechanical rig",
+        ],
+        limitations=[
+            "Needs charging or battery logistics",
+            "Electronics are harder to repair in the field",
+        ],
+    )
+
+
+def _wearable_generic_concept(domain: str, product: str, env: str) -> ConceptArchitecture:
+    return ConceptArchitecture(
+        concept_id="CONCEPT_C",
+        title=f"Wearable / Body-Worn {domain}",
+        working_principle=f"A harness or compliant shell delivers the {product} function on the body so the user is not tied to a chair or bench.",
+        subsystem_mapping={
+            "Power / Actuation": "Elastic energy or a tiny haptic cell",
+            "Core Function": f"Body-conforming {product} stage",
+            "Chassis & Structure": "Printed stays, webbing, breathable textile",
+            "Status Feedback": "Haptic tap or colour indicator",
+        },
+        manufacturing_strategy="3D-printed stays and sewn webbing, no specialised factory.",
+        strengths=[
+            "Moves with the user",
+            "Low mass and no floor footprint",
+            "Can be sized and reprinted quickly",
+        ],
+        limitations=[
+            "Limited force compared with a floor-standing machine",
+            "Must be comfortable for a full shift",
+        ],
+    )
+
+
+def _community_generic_concept(domain: str, product: str, env: str) -> ConceptArchitecture:
+    return ConceptArchitecture(
+        concept_id="CONCEPT_C",
+        title=f"Shared Modular {domain} Kit",
+        working_principle=f"A modular {product} is shared at community scale so households that cannot buy a commercial unit still get access, with field-replaceable subassemblies.",
+        subsystem_mapping={
+            "Power / Actuation": "Optional shared battery or purely manual modules",
+            "Core Function": f"Stackable {product} modules sized for one household lot",
+            "Chassis & Structure": f"Lockable shared cage or cart for {env.lower()}",
+            "Status Feedback": "Tag board showing who holds which module",
+        },
+        manufacturing_strategy="Repeatable modules from local stock; one shared precision part.",
+        strengths=[
+            "Splits capital cost across users",
+            "Failed modules swap without scrapping the whole system",
+            "Matches cooperative use already common in villages and factories",
+        ],
+        limitations=[
+            "Needs a sharing rule",
+            "Peak demand may queue users",
+        ],
+    )
+
+
+def family_bom(winning_concept: ConceptArchitecture, ctx: Dict[str, Any]) -> List[Dict[str, str]]:
+    theme = family_solution_kit(ctx)["bom_theme"]
+    catalogs = {
+        "oxygen": [
+            {"item": "Oil-free piston compressor compatible with medical air", "quantity": "1 Unit", "source": "Industrial compressor dealer", "cost_inr": "8,400"},
+            {"item": "Zeolite 13X molecular sieve (rechargeable canisters)", "quantity": "4 kg", "source": "Chemical supplier", "cost_inr": "3,600"},
+            {"item": "Medical-grade oxygen tubing, cannula, and check valves", "quantity": "1 Kit", "source": "Hospital supplier", "cost_inr": "1,250"},
+            {"item": "Mild-steel clinic frame, casters, and belt drive set", "quantity": "1 Assembly", "source": "Local fabricator", "cost_inr": "2,800"},
+            {"item": "Analog oxygen flowmeter and purity cell", "quantity": "1 Unit", "source": "Instrumentation supplier", "cost_inr": "2,150"},
+            {"item": "Buffer cylinder strap kit and pressure relief", "quantity": "1 Kit", "source": "Gas equipment dealer", "cost_inr": "1,900"},
+        ],
+        "filtration": [
+            {"item": "HDPE drum pair and hydrocyclone body blank", "quantity": "1 Set", "source": "Agri hardware store", "cost_inr": "2,400"},
+            {"item": "Stainless 80-mesh screen and gasket kit", "quantity": "2 Sheets", "source": "Mesh supplier", "cost_inr": "980"},
+            {"item": "Angle-iron skid and hose camlocks", "quantity": "1 Assembly", "source": "Local fabricator", "cost_inr": "1,450"},
+            {"item": "Sight glass, float, and ball valves", "quantity": "1 Kit", "source": "Plumbing supplier", "cost_inr": "720"},
+            {"item": "Optional 12V diaphragm pump (Concept B path)", "quantity": "1 Unit", "source": "Solar pump dealer", "cost_inr": "2,100"},
+            {"item": "Food-safe silicone sealant and fasteners", "quantity": "1 Kit", "source": "Hardware store", "cost_inr": "380"},
+        ],
+        "grain": [
+            {"item": "Food-grade 200 L HDPE drums with gasket lids", "quantity": "6 Units", "source": "Taluka market", "cost_inr": "7,200"},
+            {"item": "Cement, brick, and sand for 400 mm flood plinth", "quantity": "1 Plinth", "source": "Local mason", "cost_inr": "3,400"},
+            {"item": "Weld-mesh rat skirt and padlock hasps", "quantity": "1 Kit", "source": "Hardware store", "cost_inr": "1,150"},
+            {"item": "Inner grain liners and scoop", "quantity": "6 + 1", "source": "Agri store", "cost_inr": "900"},
+            {"item": "Humidity indicator cards", "quantity": "12 Cards", "source": "Packaging supplier", "cost_inr": "360"},
+            {"item": "Optional shared moisture meter", "quantity": "1 Unit", "source": "Agri extension shop", "cost_inr": "1,800"},
+        ],
+        "energy": [
+            {"item": "200W photovoltaic panel with polycarbonate shield", "quantity": "1 Unit", "source": "Solar dealer", "cost_inr": "6,800"},
+            {"item": "100Ah LiFePO4 battery and MPPT charge controller", "quantity": "1 Set", "source": "Solar dealer", "cost_inr": "12,500"},
+            {"item": "12V LED classroom lighting string", "quantity": "2 Classrooms", "source": "Electrical store", "cost_inr": "1,600"},
+            {"item": "USB-C PD charging locker hardware", "quantity": "8 Ports", "source": "Electronics supplier", "cost_inr": "2,200"},
+            {"item": "Welded anti-theft panel cage and indoor hub box", "quantity": "1 Assembly", "source": "Local fabricator", "cost_inr": "2,400"},
+            {"item": "Fusing, low-voltage disconnect, and voltmeter", "quantity": "1 Kit", "source": "Electrical store", "cost_inr": "950"},
+        ],
+        "ergonomics": [
+            {"item": "PETG filament for lumbar stay shells (3 sizes)", "quantity": "900 g", "source": "Fab Lab", "cost_inr": "1,350"},
+            {"item": "Elastic webbing, foam, and garment buckles", "quantity": "1 Kit", "source": "Textile cluster supplier", "cost_inr": "780"},
+            {"item": "Optional IMU + haptic pod for biofeedback", "quantity": "1 Unit", "source": "Electronics kit", "cost_inr": "1,450"},
+            {"item": "Steel tripod and foam pad for sit-stand stool path", "quantity": "1 Unit", "source": "Local fabricator", "cost_inr": "1,900"},
+            {"item": "Velcro, thread, and lining fabric", "quantity": "1 Kit", "source": "Garment shop", "cost_inr": "420"},
+            {"item": "Fasteners and adjustment sliders", "quantity": "1 Kit", "source": "Hardware store", "cost_inr": "260"},
+        ],
+    }
+    if theme in catalogs:
+        return catalogs[theme]
+
+    domain = ctx.get("primary_domain", "System")
+    product = ctx.get("product_phrase", domain.lower())
+    return [
+        {"item": f"{product.title()} core mechanism / structure", "quantity": "1 Unit", "source": "Local fabricator", "cost_inr": "2,400"},
+        {"item": "Makerspace-printed housings and jigs", "quantity": "400 g", "source": "Fab Lab", "cost_inr": "720"},
+        {"item": "Fastener, bearing, and seal kit", "quantity": "1 Kit", "source": "Hardware store", "cost_inr": "680"},
+        {"item": "Analog status indicator", "quantity": "1 Unit", "source": "Instrumentation supplier", "cost_inr": "540"},
+        {"item": f"Materials selected for {winning_concept.title}", "quantity": "1 Set", "source": "As per manufacturing strategy", "cost_inr": "1,100"},
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool 1: Empathy Analysis Tool
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,59 +997,44 @@ ALL content must be SPECIFIC to the problem described, not generic.
         if llm_data and "persona_title" in llm_data:
             return EmpathyMap(**{k: v for k, v in llm_data.items() if k in EmpathyMap.model_fields})
 
-        # Deep semantic fallback — builds from actual text
         ctx = deep_parse(notes)
+        kit = family_solution_kit(ctx)
         domain = ctx["primary_domain"]
+        product = ctx["product_phrase"]
         env = ctx["environment"]
         pain_s = ctx["pain_sentences"]
         request_s = ctx["request_sentences"]
         workaround_s = ctx["workaround_sentences"]
         constraints_s = ctx["constraints_raw"]
 
-        # Build Says from actual pain/request sentences
-        says = []
-        for s in (pain_s + request_s)[:3]:
-            says.append(f'"{s.strip()}"')
+        says = [_quote(s, f"The current {product} is failing us.") for s in (pain_s + request_s)[:3]]
         while len(says) < 3:
-            says.append(f'"The existing {domain.lower()} approach creates unnecessary burden in our daily workflow."')
+            says.append(_quote("", f"We cannot keep depending on a commercial {product} that was not designed for this setting."))
 
-        # Thinks: infer from domain + pain
-        pain_word = pain_s[0].strip().lower()[:60] if pain_s else f"existing {domain.lower()} issues"
         thinks = [
-            f"\"Why does the current {domain.lower()} design ignore the real physical constraints of our environment?\"",
-            f"\"If we had a simpler, locally maintainable system we would save significant time and cost.\"",
-            f"\"I am worried that {pain_word} will worsen if we keep relying on commercial products not designed for us.\""
+            f'\"Why is the available {product} ignoring {env.lower()}?\"',
+            f'\"If this were repairable locally, we would not lose days of {domain.lower()} every time it fails.\"',
+            f'\"I worry that \'{pain_s[0].strip()[:90]}\' will get worse if nothing changes.\"',
         ]
 
-        # Does: from workaround sentences
-        does = []
-        for s in workaround_s[:2]:
-            does.append(s.strip())
-        does.append(f"Continuously adapts {domain.lower()} workflow using improvised materials to compensate for shortcomings of existing equipment.")
+        does = [s.strip() for s in workaround_s[:2]]
+        if request_s:
+            does.append(request_s[0].strip())
+        does.append(f"Improvises around a missing or failing {product} during daily work.")
         does = does[:3]
 
-        # Feels: emotional consequences of pain sentences
         feels = [
-            f"Frustrated by recurring downtime and the hidden cost of maintaining inadequate {domain.lower()} systems.",
-            f"Overwhelmed by the physical and mental effort required to compensate for poorly designed tools.",
-            f"Hopeful that a purpose-built, field-appropriate {domain.lower()} solution can be developed and deployed locally."
+            f"Frustrated that {product} failures keep interrupting essential work.",
+            f"Exhausted by workarounds required in {env.lower()}.",
+            f"Hopeful that a purpose-built {domain.lower()} solution can be made and repaired nearby.",
         ]
 
-        # Core pain points from actual text
         core_pains = [s.strip() for s in pain_s[:3]]
         while len(core_pains) < 3:
-            core_pains.append(f"High operational downtime and component failure rate of current {domain.lower()} systems.")
+            core_pains.append(f"Existing {product} options are too costly, fragile, or unavailable when needed.")
 
-        # Latent needs: reframe pains into needs
-        latent_needs = [
-            f"A reliable {domain.lower()} mechanism that operates continuously without dependency on unstable external utilities.",
-            f"An open-architecture, modular design that can be maintained and repaired by local technicians without specialized tools.",
-            f"Real-time intuitive status feedback that non-technical users can interpret without digital readouts or error codes."
-        ]
-
-        # Constraints from text or environment
         op_constraints = [s.strip() for s in constraints_s[:2]]
-        op_constraints.append(f"{env}.")
+        op_constraints.append(env.rstrip(".") + ".")
         op_constraints = op_constraints[:3]
 
         return EmpathyMap(
@@ -361,7 +1044,7 @@ ALL content must be SPECIFIC to the problem described, not generic.
             does=does,
             feels=feels,
             core_pain_points=core_pains,
-            latent_unmet_needs=latent_needs,
+            latent_unmet_needs=kit["latent_needs"],
             operating_constraints=op_constraints
         )
 
@@ -392,32 +1075,24 @@ ALL responses must be directly tied to the specific problem described. No generi
             return ProblemDefinition(**{k: v for k, v in llm_data.items() if k in ProblemDefinition.model_fields})
 
         ctx = deep_parse(original_text) if original_text else {}
+        kit = family_solution_kit(ctx) if ctx else {"hmw": empathy.latent_unmet_needs}
         domain = ctx.get("primary_domain", "System")
-        top_nouns = ctx.get("top_nouns", [domain.lower()])
-        noun2 = top_nouns[1] if len(top_nouns) > 1 else "performance"
-        noun3 = top_nouns[2] if len(top_nouns) > 2 else "maintenance"
+        product = ctx.get("product_phrase", domain.lower())
 
         pov = (
-            f"{empathy.persona_title} needs {empathy.latent_unmet_needs[0]} "
+            f"{empathy.persona_title} needs {empathy.latent_unmet_needs[0].rstrip('.')} "
             f"because {empathy.core_pain_points[0].rstrip('.')}."
         )
 
-        hmw = [
-            f"How might we redesign the core {domain.lower()} mechanism to function without continuous external power or utilities?",
-            f"How might we reduce {noun2}-related failures by 80% through modular, field-replaceable subcomponents?",
-            f"How might we use digital fabrication (3D printing, laser cutting) to produce a {domain.lower()} unit at less than 30% of current commercial cost?",
-            f"How might we provide clear, tool-free {noun3} procedures that non-technical users can execute in under 5 minutes?"
-        ]
-
         func_reqs = [
-            f"Primary {domain} operational throughput must match or exceed existing commercial benchmarks within the same physical envelope.",
-            f"All structural subassemblies must use only standard M4/M5 fasteners for field assembly without specialist tools.",
-            f"Modular cartridge architecture enabling sub-10-minute component replacement in the operating environment."
+            f"The {product} must keep working in this context: {ctx.get('environment', empathy.operating_constraints[0])}.",
+            f"Critical wear parts of the {domain.lower()} solution must be replaceable with locally available tools.",
+            f"First prototype BOM should stay in a makerspace / Fab Lab cost band rather than imported capital equipment.",
         ]
 
         return ProblemDefinition(
             pov_statement=pov,
-            hmw_opportunity_spaces=hmw,
+            hmw_opportunity_spaces=kit["hmw"],
             functional_requirements=func_reqs,
             engineering_constraints=empathy.operating_constraints
         )
@@ -457,80 +1132,8 @@ Return a JSON list (not object) of 3 concepts, each with:
                 except Exception:
                     pass
 
-        # Build fully domain-specific concepts from parsed context
-        domain = ctx.get("primary_domain", "System")
-        env = ctx.get("environment", "field environment")
-        top_nouns = ctx.get("top_nouns", [domain.lower()])
-        noun2 = top_nouns[1].capitalize() if len(top_nouns) > 1 else "Modular"
-        noun3 = top_nouns[2].capitalize() if len(top_nouns) > 2 else "Control"
-
-        c1 = ConceptArchitecture(
-            concept_id="CONCEPT_A",
-            title=f"Mechanical Passive-Linkage {domain} Unit",
-            working_principle=f"A zero-electricity kinematic mechanism using counterbalanced levers, cams, or spring-loaded actuators to perform the core {domain.lower()} function. The design leverages stored mechanical potential energy to maintain consistent operation without any electrical supply.",
-            subsystem_mapping={
-                "Power / Actuation": f"Reciprocating foot or hand lever with flywheel inertia to smooth pulsation in the {domain.lower()} cycle",
-                f"Core {domain} Stage": f"Positive displacement cam-driven mechanism with {noun2.lower()} sealing stage",
-                "Chassis & Structure": "Laser-cut 6mm birch plywood interlocking chassis with M5 bolt assembly",
-                f"{noun3} & Feedback": "Mechanical dial gauge and transparent inspection window for visual status confirmation"
-            },
-            manufacturing_strategy=f"Laser-cut plywood chassis, FDM 3D printed cam housing and linkage guides, COTS bearings and springs from local hardware.",
-            strengths=[
-                f"100% independent from any electrical grid, battery, or digital controller",
-                f"Entire unit repairable by a local {env.split()[0].lower()} technician using basic tools",
-                f"Bill of Materials sourced entirely from hardware stores and Fab Lab stock, reducing cost by 65%+"
-            ],
-            limitations=[
-                f"Requires intermittent physical input; unsuitable for unattended long-duration {domain.lower()} sessions",
-                "Larger physical envelope due to mechanical linkage geometry"
-            ]
-        )
-
-        c2 = ConceptArchitecture(
-            concept_id="CONCEPT_B",
-            title=f"12V DC Sensor-Integrated Smart {domain} System",
-            working_principle=f"An ultra-efficient brushless 12V DC motor drives the core {domain.lower()} function, controlled by a microcontroller reading real-time sensor feedback. The system is powered by swappable battery packs or a portable solar panel with MPPT charge control.",
-            subsystem_mapping={
-                "Power / Actuation": "12V 150W BLDC motor with hall-effect encoder and closed-loop PID speed control",
-                f"Core {domain} Stage": f"High-efficiency motorized {domain.lower()} mechanism with {noun2.lower()} inlet/outlet stage",
-                "Chassis & Structure": "CNC-bent 2mm aluminum sheet chassis with vibration-damping silicone mounts",
-                f"{noun3} & Feedback": "Low-power OLED display with real-time throughput, temperature, and alert status"
-            },
-            manufacturing_strategy=f"CNC bent aluminum sheet metal, 3D printed sensor brackets and cable guides, COTS electronic modules and swappable battery system.",
-            strengths=[
-                f"Automated, effortless and consistent {domain.lower()} delivery without physical human effort",
-                f"Closed-loop digital control maintains optimal performance despite {env.lower()} variability",
-                "Compact portable enclosure with hot-swap battery enabling rapid field deployment"
-            ],
-            limitations=[
-                "Requires access to solar charging or battery recharging infrastructure",
-                "Higher initial capital cost due to BLDC driver and sensor electronics"
-            ]
-        )
-
-        c3 = ConceptArchitecture(
-            concept_id="CONCEPT_C",
-            title=f"Wearable / Compliant Mechanism {domain} Solution",
-            working_principle=f"A monolithic compliant flexure or wearable harness design that passively performs the {domain.lower()} function using body motion, gravity, or elastic stored energy. The structure deforms elastically to accomplish the functional task without rigid moving joints.",
-            subsystem_mapping={
-                "Power / Actuation": f"Elastic strain energy stored in flexure hinges or memory foam padding, released during natural {domain.lower()} motion",
-                f"Core {domain} Stage": f"Compliant monolithic {domain.lower()} stage with integrated {noun2.lower()} function and self-resetting spring return",
-                "Chassis & Structure": "Single-piece waterjet-cut polypropylene or PETG flexure body with snap-fit joints",
-                f"{noun3} & Feedback": f"Haptic vibration motor or color-coded indicator strip providing non-visual {domain.lower()} status alert"
-            },
-            manufacturing_strategy=f"Monolithic waterjet-cut or injection molded HDPE flexure, elastic polymer straps and Velcro closures, no-tool field adjustment.",
-            strengths=[
-                "Zero friction joints eliminates all bearing wear, lubrication, and mechanical fatigue failure modes",
-                f"Highly portable: unit weighs under 500g and fits inside a standard backpack for {env.lower()} deployment",
-                f"Fully passive in idle state, activating only when needed through natural user motion"
-            ],
-            limitations=[
-                f"Limited force output compared to powered alternatives; unsuitable for high-load {domain.lower()} requirements",
-                "Polymer fatigue design requires specialist finite element validation for long-term durability"
-            ]
-        )
-
-        return [c1, c2, c3]
+        kit = family_solution_kit(ctx or {})
+        return kit["concepts"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,20 +1141,21 @@ Return a JSON list (not object) of 3 concepts, each with:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PughMatrixEvaluatorTool:
-    def execute(self, concepts: List[ConceptArchitecture], api_key: Optional[str] = None) -> List[PughScoringRow]:
+    def execute(
+        self,
+        concepts: List[ConceptArchitecture],
+        ctx: Optional[Dict[str, Any]] = None,
+        api_key: Optional[str] = None,
+    ) -> List[PughScoringRow]:
+        kit = family_solution_kit(ctx or {})
+        weights = kit["pugh"]
         scores = []
+        ranked_totals = []
         for c in concepts:
-            if c.concept_id == "CONCEPT_A":
-                d, f, v, m = 1, 2, 2, 2
-            elif c.concept_id == "CONCEPT_B":
-                d, f, v, m = 2, 1, 0, 1
-            else:
-                d, f, v, m = 1, 1, 1, 2
-
+            d, f, v, m = weights.get(c.concept_id, (1, 1, 1, 1))
             total = d + f + v + m
-            decision = "WINNING CONCEPT" if total >= 7 else ("STRONG RUNNER-UP" if total >= 5 else "ELIMINATED")
-
-            scores.append(PughScoringRow(
+            ranked_totals.append(total)
+            scores.append((total, PughScoringRow(
                 concept_id=c.concept_id,
                 title=c.title,
                 desirability_score=d,
@@ -559,10 +1163,21 @@ class PughMatrixEvaluatorTool:
                 viability_score=v,
                 maintainability_score=m,
                 total_score=total,
-                decision=decision
-            ))
+                decision="CANDIDATE",
+            )))
 
-        return sorted(scores, key=lambda x: x.total_score, reverse=True)
+        scores.sort(key=lambda row: row[0], reverse=True)
+        max_total = scores[0][0] if scores else 0
+        labelled = []
+        for i, (total, row) in enumerate(scores):
+            if total == max_total and i == 0:
+                row.decision = "WINNING CONCEPT"
+            elif total >= max_total - 1:
+                row.decision = "STRONG RUNNER-UP"
+            else:
+                row.decision = "ELIMINATED"
+            labelled.append(row)
+        return labelled
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -572,39 +1187,22 @@ class PughMatrixEvaluatorTool:
 class BOMPrototypingTool:
     def execute(self, winning_concept: ConceptArchitecture, ctx: Dict = {}, api_key: Optional[str] = None) -> PrototypingPlan:
         domain = ctx.get("primary_domain", "System")
-        top_nouns = ctx.get("top_nouns", [domain.lower()])
-        noun2 = top_nouns[1] if len(top_nouns) > 1 else "functional"
+        product = ctx.get("product_phrase", domain.lower())
         env = ctx.get("environment", "field environment")
-
-        # Build BOM from actual domain and concept subsystems
         subsystems = list(winning_concept.subsystem_mapping.values())
-
-        bom = [
-            {"item": f"{domain} Core Actuator/Mechanism Assembly", "quantity": "1 Unit", "source": "Mechanical Hardware Supplier", "cost_inr": "2,200"},
-            {"item": f"High-Strength Aluminum Profile Extrusions (30x30mm)", "quantity": "4 x 400mm lengths", "source": "Local Metal Stockist", "cost_inr": "1,350"},
-            {"item": f"FDM PETG 3D Printed Housing for {subsystems[0][:30] if subsystems else domain}", "quantity": "450 grams", "source": "Fab Lab 3D Printer", "cost_inr": "800"},
-            {"item": f"6mm Birch Plywood Laser-Cut Structural Panels", "quantity": "2 Sheets (600x400mm)", "source": "Fab Lab Laser Cutter", "cost_inr": "920"},
-            {"item": f"{noun2.capitalize()}-Specific Sealing Components (O-rings, Gaskets)", "quantity": "1 Kit", "source": "Rubber & Seals Supplier", "cost_inr": "580"},
-            {"item": "Precision Ball Bearings 608-2RS (x4) and 6204 (x2)", "quantity": "6 Units", "source": "Industrial Bearing Supplier", "cost_inr": "720"},
-            {"item": f"Analog Status Indicator (Pressure / Flow / Displacement Gauge)", "quantity": "1 Unit", "source": "Instrumentation Supplier", "cost_inr": "680"},
-            {"item": "Stainless Steel Fastener Kit (M4/M5 bolts, locknuts, washers)", "quantity": "1 Assorted Kit", "source": "Hardware Store", "cost_inr": "420"},
-            {"item": f"Vibration-Dampening Silicone Mounts and Compression Springs", "quantity": "1 Set", "source": "Industrial Hardware", "cost_inr": "480"}
-        ]
-
+        bom = family_bom(winning_concept, ctx or {})
         total = sum(float(item["cost_inr"].replace(",", "")) for item in bom)
 
         phases = {
-            f"Phase 1: {domain} Proof-of-Concept Bench Rig (Weeks 1-2)": (
-                f"Construct a basic benchtop mockup using plywood and 3D printed parts to validate "
-                f"the core {domain.lower()} working principle and measure primary performance metrics."
+            f"Phase 1: {domain} proof-of-principle (Weeks 1-2)": (
+                f"Build a bench mockup of '{winning_concept.title}' to test the {product} working principle "
+                f"against the stated pain: {(ctx.get('pain_sentences') or ['field failure'])[0]}."
             ),
-            f"Phase 2: Fab Lab Full Prototype & Ergonomics Evaluation (Weeks 3-4)": (
-                f"Fabricate the complete structural chassis using laser-cut panels and PETG printed "
-                f"housings. Assemble all subsystems and evaluate user ergonomics and clearances specific to {env.lower()}."
+            f"Phase 2: Full prototype in the real setting (Weeks 3-4)": (
+                f"Fabricate the chassis and all four subsystems. Evaluate fit, safety, and repair steps in {env.lower()}."
             ),
-            f"Phase 3: {domain} Endurance & Field Stress Testing (Weeks 5-6)": (
-                f"Conduct continuous 50-hour operational testing under simulated {env.lower()} conditions. "
-                f"Measure throughput, failure rates, and document field repair procedures."
+            f"Phase 3: Endurance and field repair drill (Weeks 5-6)": (
+                f"Run a 50-hour duty cycle on the {product}, log failures, and write a one-page field repair sheet."
             )
         }
 

@@ -52,7 +52,7 @@ class InnoAgentOrchestrator:
         })
 
         # Stage 4: Evaluate
-        pugh_scores = self.pugh_tool.execute(concepts, api_key=api_key)
+        pugh_scores = self.pugh_tool.execute(concepts, ctx=ctx, api_key=api_key)
         winning_score = pugh_scores[0]
         winning_concept = next(c for c in concepts if c.concept_id == winning_score.concept_id)
         agent_trace.append({
